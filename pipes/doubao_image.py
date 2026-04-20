@@ -39,9 +39,7 @@ class APIException(Exception):
 
     def __str__(self) -> str:
         try:
-            return (
-                json.loads(self._content).get("error", {}).get("message", self._content)
-            )
+            return json.loads(self._content).get("error", {}).get("message", self._content)
         except Exception:
             pass
         try:
@@ -73,9 +71,7 @@ class Pipe:
             title="尺寸",
             description="支持 2K、3K 或像素尺寸，例如 2048x2048",
         )
-        output_format: Literal["png", "jpeg"] = Field(
-            default="png", title="输出格式"
-        )
+        output_format: Literal["png", "jpeg"] = Field(default="png", title="输出格式")
         watermark: bool = Field(default=False, title="AI 水印")
         enable_web_search: bool = Field(default=False, title="启用联网搜索")
 
@@ -84,29 +80,21 @@ class Pipe:
 
     def pipes(self) -> List[dict]:
         return [
-            {"id": model.strip(), "name": model.strip()}
-            for model in self.valves.models.split(",")
-            if model.strip()
+            {"id": model.strip(), "name": model.strip()} for model in self.valves.models.split(",") if model.strip()
         ]
 
-    async def pipe(
-        self, body: dict, __user__: dict, __request__: Request
-    ) -> StreamingResponse:
+    async def pipe(self, body: dict, __user__: dict, __request__: Request) -> StreamingResponse:
         return StreamingResponse(
             self._pipe(body=body, __user__=__user__, __request__=__request__),
             media_type="text/event-stream",
         )
 
-    async def _pipe(
-        self, body: dict, __user__: dict, __request__: Request
-    ) -> AsyncIterable[str]:
+    async def _pipe(self, body: dict, __user__: dict, __request__: Request) -> AsyncIterable[str]:
         user = Users.get_user_by_id(__user__["id"])
         if not user:
             raise ValueError("user not found")
 
-        model, payload = await self._build_payload(
-            user=user, body=body, user_valves=__user__.get("valves", {})
-        )
+        model, payload = await self._build_payload(user=user, body=body, user_valves=__user__.get("valves", {}))
 
         async with httpx.AsyncClient(
             base_url=self.valves.base_url,
@@ -131,25 +119,15 @@ class Pipe:
                 output_format=payload["json"]["output_format"],
             )
             if body.get("stream"):
-                yield self._format_data(
-                    is_stream=True, model=model, content=content, usage=None
-                )
+                yield self._format_data(is_stream=True, model=model, content=content, usage=None)
                 if usage:
-                    yield self._format_data(
-                        is_stream=True, model=model, content=None, usage=usage
-                    )
+                    yield self._format_data(is_stream=True, model=model, content=None, usage=usage)
             else:
-                yield self._format_data(
-                    is_stream=False, model=model, content=content, usage=usage
-                )
+                yield self._format_data(is_stream=False, model=model, content=content, usage=usage)
 
-    async def _build_payload(
-        self, user: UserModel, body: dict, user_valves: Any
-    ) -> Tuple[str, dict]:
+    async def _build_payload(self, user: UserModel, body: dict, user_valves: Any) -> Tuple[str, dict]:
         user_valves = self._normalize_user_valves(user_valves)
-        model = (
-            body["model"].split(".", 1)[1] if "." in body["model"] else body["model"]
-        )
+        model = body["model"].split(".", 1)[1] if "." in body["model"] else body["model"]
 
         prompt, images = await self._parse_messages(user=user, body=body)
 
@@ -172,9 +150,7 @@ class Pipe:
 
         if user_valves.n > 1:
             data["sequential_image_generation"] = "auto"
-            data["sequential_image_generation_options"] = {
-                "max_images": user_valves.n
-            }
+            data["sequential_image_generation_options"] = {"max_images": user_valves.n}
 
         if user_valves.enable_web_search:
             data["tools"] = [{"type": "web_search"}]
@@ -185,9 +161,7 @@ class Pipe:
         }
         return model, payload
 
-    async def _parse_messages(
-        self, user: UserModel, body: dict
-    ) -> Tuple[str, List[str]]:
+    async def _parse_messages(self, user: UserModel, body: dict) -> Tuple[str, List[str]]:
         prompt_parts: List[str] = []
         images: List[str] = []
 
@@ -209,9 +183,7 @@ class Pipe:
                     if not line:
                         continue
                     if line.startswith("![") and "-image-" in line:
-                        data_url = await self._get_image_data_url_from_markdown(
-                            user=user, markdown_string=line
-                        )
+                        data_url = await self._get_image_data_url_from_markdown(user=user, markdown_string=line)
                         if data_url:
                             images.append(data_url)
                             continue
@@ -264,10 +236,7 @@ class Pipe:
                 results.append(image_markdown)
 
         if not results and response_json.get("error"):
-            raise ValueError(
-                self._extract_error_message(response_json["error"])
-                or "Unknown API error"
-            )
+            raise ValueError(self._extract_error_message(response_json["error"]) or "Unknown API error")
 
         if not results:
             raise ValueError("未解析到豆包图片响应")
@@ -325,14 +294,10 @@ class Pipe:
             user=user,
             metadata={"mime_type": mime_type},
         )
-        image_url = __request__.app.url_path_for(
-            "get_file_content_by_id", id=file_item.id
-        )
+        image_url = __request__.app.url_path_for("get_file_content_by_id", id=file_item.id)
         return f"![doubao-image-{file_item.id}]({image_url})"
 
-    async def _get_image_data_url_from_markdown(
-        self, user: UserModel, markdown_string: str
-    ) -> str:
+    async def _get_image_data_url_from_markdown(self, user: UserModel, markdown_string: str) -> str:
         file_id = self._extract_file_id_from_markdown(markdown_string)
         if not file_id:
             return ""
@@ -341,10 +306,7 @@ class Pipe:
         with open(file_response.path, "rb") as file_content:
             image_bytes = file_content.read()
 
-        mime_type = (
-            mimetypes.guess_type(file_response.path)[0]
-            or "image/png"
-        )
+        mime_type = mimetypes.guess_type(file_response.path)[0] or "image/png"
         encoded = base64.b64encode(image_bytes).decode()
         return f"data:{mime_type};base64,{encoded}"
 
