@@ -21,7 +21,7 @@ from httpx import Response
 from open_webui.env import GLOBAL_LOG_LEVEL
 from open_webui.models.users import UserModel
 from open_webui.routers.files import get_file_content_by_id
-from open_webui.routers.images import upload_image
+from open_webui.routers.images import get_image_data, upload_image
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
@@ -94,8 +94,9 @@ class Pipe:
         __metadata__: Optional[dict] = None,
     ) -> AsyncIterable[str]:
         user = self._get_user(__user__)
-        model, payload = await self._build_payload(user=user, body=body, user_valves=__user__.get("valves", {}))
-        # call client
+        model, payload, multipart_fallback = await self._build_payload(
+            user=user, body=body, user_valves=__user__.get("valves", {})
+        )
         async with httpx.AsyncClient(
             base_url=self.valves.base_url,
             headers={"Authorization": f"Bearer {self.valves.api_key}"},
@@ -104,6 +105,8 @@ class Pipe:
             timeout=self.valves.timeout,
         ) as client:
             response = await client.post(**payload)
+            if response.status_code != 200 and multipart_fallback and self._should_retry_with_multipart(response.text):
+                response = await client.post(**multipart_fallback)
             if response.status_code != 200:
                 raise APIException(status=response.status_code, content=response.text, response=response)
             response = response.json()
@@ -164,9 +167,13 @@ class Pipe:
             encoded = base64.b64encode(file_content.read()).decode()
         return f"data:{mime_type};base64,{encoded}"
 
-    async def _build_payload(self, user: UserModel, body: dict, user_valves: UserValves) -> Tuple[str, dict]:
-        # payload
-        model = body["model"].split(".", 1)[1]
+    async def _build_payload(
+        self,
+        user: UserModel,
+        body: dict,
+        user_valves: UserValves,
+    ) -> Tuple[str, dict, Optional[dict]]:
+        model = body["model"].split(".", 1)[1] if "." in body["model"] else body["model"]
         user_valves = self._normalize_user_valves(user_valves)
         images = []
         prompt_parts = []
@@ -225,15 +232,83 @@ class Pipe:
         if not images:
             payload["json"]["n"] = self.valves.num_of_images
             payload["json"]["aspect_ratio"] = user_valves.aspect_ratio
-        elif len(images) == 1:
-            payload["json"]["image"] = images[0]
-            payload["url"] = "/images/edits"
-        else:
-            payload["json"]["images"] = images
-            payload["json"]["aspect_ratio"] = user_valves.aspect_ratio
-            payload["url"] = "/images/edits"
+            return model, payload, None
 
-        return model, payload
+        if len(images) == 1:
+            payload["json"]["image"] = images[0]
+        else:
+            payload["json"]["aspect_ratio"] = user_valves.aspect_ratio
+            payload["json"]["images"] = images
+        payload["url"] = "/images/edits"
+
+        multipart_fallback = await self._build_multipart_edit_payload(
+            images=images,
+            model=model,
+            prompt=prompt,
+            user_valves=user_valves,
+        )
+        return model, payload, multipart_fallback
+
+    async def _build_multipart_edit_payload(
+        self,
+        images: list[dict],
+        model: str,
+        prompt: str,
+        user_valves: "Pipe.UserValves",
+    ) -> dict:
+        data = {
+            "model": model,
+            "prompt": prompt,
+            "resolution": user_valves.resolution,
+            "response_format": "b64_json",
+        }
+        if user_valves.aspect_ratio != "auto":
+            data["aspect_ratio"] = user_valves.aspect_ratio
+
+        files = [await self._image_ref_to_multipart_file(image=image, field_name="image[]") for image in images]
+        return {
+            "url": "/images/edits",
+            "data": self._stringify_form_data(data),
+            "files": files,
+        }
+
+    async def _image_ref_to_multipart_file(
+        self,
+        image: dict,
+        field_name: str,
+    ) -> tuple[str, tuple[str, bytes, str]]:
+        image_url = image.get("url", "")
+        if not image_url:
+            raise TypeError("message content invalid")
+
+        image_bytes, mime_type = await get_image_data(image_url)
+        if image_bytes is None or not mime_type:
+            raise ValueError("invalid image input")
+
+        file_ext = mimetypes.guess_extension(mime_type) or ".png"
+        if file_ext == ".jpe":
+            file_ext = ".jpg"
+
+        return (
+            field_name,
+            (f"{uuid.uuid4().hex}{file_ext}", image_bytes, mime_type),
+        )
+
+    @staticmethod
+    def _stringify_form_data(data: dict) -> dict:
+        form_data = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                form_data[key] = "true" if value else "false"
+            else:
+                form_data[key] = str(value)
+        return form_data
+
+    @staticmethod
+    def _should_retry_with_multipart(response_text: str) -> bool:
+        return "failed to parse multipart form" in response_text.lower()
 
     @staticmethod
     def _normalize_user_valves(user_valves: UserValves | dict) -> UserValves:

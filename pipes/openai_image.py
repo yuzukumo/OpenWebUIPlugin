@@ -21,7 +21,7 @@ from httpx import Response
 from open_webui.env import GLOBAL_LOG_LEVEL
 from open_webui.models.users import UserModel
 from open_webui.routers.files import get_file_content_by_id
-from open_webui.routers.images import upload_image
+from open_webui.routers.images import get_image_data, upload_image
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
@@ -110,7 +110,7 @@ class Pipe:
             trust_env=True,
             timeout=self.valves.timeout,
         ) as client:
-            if body.get("stream"):
+            if body.get("stream") and "json" in payload:
                 async for chunk in self._stream_pipe(
                     client=client,
                     payload=payload,
@@ -135,7 +135,12 @@ class Pipe:
             )
             usage = response_json.get("usage", None)
 
-            yield self._format_data(is_stream=False, model=model, content=content, usage=usage)
+            if body.get("stream"):
+                yield self._format_data(is_stream=True, model=model, content=content, usage=None)
+                if usage:
+                    yield self._format_data(is_stream=True, model=model, content=None, usage=usage)
+            else:
+                yield self._format_data(is_stream=False, model=model, content=content, usage=usage)
 
     async def _stream_pipe(
         self,
@@ -257,13 +262,22 @@ class Pipe:
             mask = images[1]
             images = [images[0], *images[2:]]
 
-        data["images"] = images
+        edit_data = {key: value for key, value in data.items() if key not in {"background", "moderation", "n"}}
         if user_valves.input_fidelity != "low":
-            data["input_fidelity"] = user_valves.input_fidelity
-        if mask:
-            data["mask"] = mask
+            edit_data["input_fidelity"] = user_valves.input_fidelity
 
-        payload = {"url": "/images/edits", "json": data}
+        files = [
+            await self._image_ref_to_multipart_file(user=user, image_ref=image, field_name="image[]")
+            for image in images
+        ]
+        if mask:
+            files.append(await self._image_ref_to_multipart_file(user=user, image_ref=mask, field_name="mask"))
+
+        payload = {
+            "url": "/images/edits",
+            "data": self._stringify_form_data(edit_data),
+            "files": files,
+        }
         return model, payload, user_valves.output_format
 
     async def _parse_messages(self, user: UserModel, body: dict) -> Tuple[str, List[dict]]:
@@ -443,6 +457,55 @@ class Pipe:
     def _image_ref_from_content(content: dict) -> dict:
         image_url = content["image_url"]["url"]
         return {"image_url": image_url}
+
+    async def _image_ref_to_multipart_file(
+        self,
+        user: UserModel,
+        image_ref: dict,
+        field_name: str,
+    ) -> tuple[str, tuple[str, bytes, str]]:
+        image_bytes, mime_type = await self._image_ref_to_bytes(user=user, image_ref=image_ref)
+        file_ext = mimetypes.guess_extension(mime_type) or ".png"
+        if file_ext == ".jpe":
+            file_ext = ".jpg"
+        return (
+            field_name,
+            (f"{uuid.uuid4().hex}{file_ext}", image_bytes, mime_type),
+        )
+
+    async def _image_ref_to_bytes(self, user: UserModel, image_ref: dict) -> tuple[bytes, str]:
+        if not isinstance(image_ref, dict):
+            raise TypeError("invalid image reference")
+
+        if "file_id" in image_ref:
+            file_response = await get_file_content_by_id(id=image_ref["file_id"], user=user)
+            with open(file_response.path, "rb") as file_content:
+                image_bytes = file_content.read()
+            mime_type = file_response.media_type or mimetypes.guess_type(file_response.path)[0] or "image/png"
+            return image_bytes, mime_type
+
+        image_url = image_ref.get("image_url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url", "")
+        if not isinstance(image_url, str) or not image_url:
+            raise TypeError("invalid image reference")
+
+        image_bytes, mime_type = await get_image_data(image_url)
+        if image_bytes is None or not mime_type:
+            raise ValueError("invalid image input")
+        return image_bytes, mime_type
+
+    @staticmethod
+    def _stringify_form_data(data: dict) -> dict:
+        form_data = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                form_data[key] = "true" if value else "false"
+            else:
+                form_data[key] = str(value)
+        return form_data
 
     @staticmethod
     def _mime_type_for_format(output_format: str) -> str:
