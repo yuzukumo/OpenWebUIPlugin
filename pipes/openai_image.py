@@ -2,15 +2,15 @@
 title: OpenAI Image
 author: OVINC CN, yuzukumo
 git_url: https://github.com/OVINC-CN/OpenWebUIPlugin.git
-version: 0.1.0
+version: 0.1.1
 licence: MIT
 """
 
 import base64
-import binascii
 import json
 import logging
 import mimetypes
+import re
 import time
 import uuid
 from typing import Any, AsyncIterable, List, Literal, Optional, Tuple
@@ -55,21 +55,36 @@ class Pipe:
         timeout: int = Field(default=600, title="请求超时（秒）")
         proxy: str = Field(default="", title="代理地址")
         models: str = Field(
-            default="gpt-image-1.5,gpt-image-1",
+            default="gpt-image-2",
             title="支持模型列表",
             description="多个模型用逗号分隔",
         )
 
     class UserValves(BaseModel):
         quality: Literal["low", "medium", "high", "auto"] = Field(default="auto", title="图片质量")
-        size: Literal["1024x1024", "1536x1024", "1024x1536", "auto"] = Field(default="auto", title="图片比例")
-        background: Literal["auto", "transparent", "opaque"] = Field(default="auto", title="背景")
+        size_preset: Literal[
+            "auto",
+            "1024x1024",
+            "1536x1024",
+            "1024x1536",
+            "2048x2048",
+            "2048x1152",
+            "3840x2160",
+            "2160x3840",
+            "customize",
+        ] = Field(
+            default="auto",
+            title="图片分辨率",
+        )
+        custom_size: str = Field(
+            default="1024x1024",
+            title="自定义分辨率",
+            description="仅在分辨率选择 customize 时生效，例如 1024x1024",
+        )
         moderation: Literal["auto", "low"] = Field(default="auto", title="审核级别")
         output_format: Literal["png", "jpeg", "webp"] = Field(default="png", title="输出格式")
         output_compression: int = Field(default=100, title="压缩质量", ge=0, le=100)
-        input_fidelity: Literal["low", "high"] = Field(default="low", title="输入保真度")
         enable_mask_mode: bool = Field(default=False, title="启用 Mask 模式")
-        partial_images: int = Field(default=0, title="流式预览图数量", ge=0, le=3)
 
     def __init__(self):
         self.valves = self.Valves()
@@ -102,6 +117,7 @@ class Pipe:
         model, payload, output_format = await self._build_payload(
             user=user, body=body, user_valves=__user__.get("valves", {})
         )
+        is_stream = bool(body.get("stream"))
 
         async with httpx.AsyncClient(
             base_url=self.valves.base_url,
@@ -110,17 +126,6 @@ class Pipe:
             trust_env=True,
             timeout=self.valves.timeout,
         ) as client:
-            if body.get("stream") and "json" in payload:
-                async for chunk in self._stream_pipe(
-                    client=client,
-                    payload=payload,
-                    user=user,
-                    __request__=__request__,
-                    metadata=__metadata__,
-                ):
-                    yield chunk
-                return
-
             response = await client.post(**payload)
             if response.status_code != 200:
                 raise APIException(status=response.status_code, content=response.text, response=response)
@@ -133,95 +138,14 @@ class Pipe:
                 __request__=__request__,
                 metadata=__metadata__,
             )
-            usage = response_json.get("usage", None)
-
-            if body.get("stream"):
-                yield self._format_data(is_stream=True, model=model, content=content, usage=None)
-                if usage:
-                    yield self._format_data(is_stream=True, model=model, content=None, usage=usage)
-            else:
-                yield self._format_data(is_stream=False, model=model, content=content, usage=usage)
-
-    async def _stream_pipe(
-        self,
-        client: httpx.AsyncClient,
-        payload: dict,
-        user: UserModel,
-        __request__: Request,
-        metadata: Optional[dict],
-    ) -> AsyncIterable[str]:
-        model = payload["json"]["model"]
-        usage = None
-        emitted = False
-        output_format = payload["json"].get("output_format", "png")
-        regular_json_response = None
-
-        stream_payload = {
-            **payload,
-            "json": {
-                **payload["json"],
-                "stream": True,
-            },
-        }
-
-        async with client.stream("POST", stream_payload["url"], json=stream_payload["json"]) as response:
-            if response.status_code != 200:
-                lines = []
-                async for line in response.aiter_lines():
-                    lines.append(line)
-                text = "".join(lines)
-                raise APIException(status=response.status_code, content=text, response=response)
-
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/event-stream" not in content_type:
-                text = await response.aread()
-                if text:
-                    regular_json_response = json.loads(text.decode("utf-8"))
-
-            if regular_json_response is not None:
-                content = await self._parse_response_images(
-                    response_json=regular_json_response,
-                    output_format=output_format,
-                    user=user,
-                    __request__=__request__,
-                    metadata=metadata,
-                )
-                usage = regular_json_response.get("usage", None)
+            usage = self._extract_usage(response_json)
+            if is_stream:
                 yield self._format_data(is_stream=True, model=model, content=content, usage=None)
                 if usage:
                     yield self._format_data(is_stream=True, model=model, content=None, usage=usage)
                 return
 
-            async for raw_line in response.aiter_lines():
-                line = raw_line.strip()
-                if not line or line.startswith("event:") or not line.startswith("data:"):
-                    continue
-                line = line[5:].strip()
-                if not line or line == "[DONE]":
-                    continue
-
-                event = json.loads(line)
-                event_type = event.get("type", "")
-
-                if event_type.endswith(".partial_image") or event_type.endswith(".completed"):
-                    content = await self._parse_stream_event(
-                        event=event,
-                        output_format=output_format,
-                        user=user,
-                        __request__=__request__,
-                        metadata=metadata,
-                    )
-                    if content:
-                        emitted = True
-                        yield self._format_data(is_stream=True, model=model, content=content, usage=None)
-                    if event_type.endswith(".completed"):
-                        usage = event.get("usage")
-
-        if not emitted:
-            raise ValueError("No image returned by OpenAI image API")
-
-        if usage:
-            yield self._format_data(is_stream=True, model=model, content=None, usage=usage)
+            yield self._format_data(is_stream=False, model=model, content=content, usage=usage)
 
     async def _build_payload(self, user: UserModel, body: dict, user_valves: Any) -> Tuple[str, dict, str]:
         user_valves = self._normalize_user_valves(user_valves)
@@ -229,6 +153,7 @@ class Pipe:
 
         prompt, images = await self._parse_messages(user=user, body=body)
         mask = await self._parse_mask(user=user, body=body)
+        size = self._resolve_size(user_valves=user_valves)
 
         data = {
             "model": model,
@@ -237,18 +162,14 @@ class Pipe:
 
         if user_valves.quality != "auto":
             data["quality"] = user_valves.quality
-        if user_valves.size != "auto":
-            data["size"] = user_valves.size
-        if user_valves.background != "auto":
-            data["background"] = user_valves.background
+        if size:
+            data["size"] = size
         if user_valves.moderation != "auto":
             data["moderation"] = user_valves.moderation
         if user_valves.output_format != "png":
             data["output_format"] = user_valves.output_format
         if user_valves.output_format in {"jpeg", "webp"} and user_valves.output_compression != 100:
             data["output_compression"] = user_valves.output_compression
-        if body.get("stream") and user_valves.partial_images > 0:
-            data["partial_images"] = user_valves.partial_images
 
         if not images:
             data["n"] = self.valves.num_of_images
@@ -262,9 +183,9 @@ class Pipe:
             mask = images[1]
             images = [images[0], *images[2:]]
 
-        edit_data = {key: value for key, value in data.items() if key not in {"background", "moderation", "n"}}
-        if user_valves.input_fidelity != "low":
-            edit_data["input_fidelity"] = user_valves.input_fidelity
+        edit_data = dict(data)
+        if self.valves.num_of_images > 1:
+            edit_data["n"] = self.valves.num_of_images
 
         files = [
             await self._image_ref_to_multipart_file(user=user, image_ref=image, field_name="image[]")
@@ -342,7 +263,7 @@ class Pipe:
         metadata: Optional[dict],
     ) -> str:
         results = []
-        for item in response_json.get("data", []):
+        for item in self._collect_image_items(response_json):
             rendered = await self._render_documented_image_item(
                 item=item,
                 output_format=output_format,
@@ -363,23 +284,6 @@ class Pipe:
 
         return "\n\n".join(results)
 
-    async def _parse_stream_event(
-        self,
-        event: dict,
-        output_format: str,
-        user: UserModel,
-        __request__: Request,
-        metadata: Optional[dict],
-    ) -> str:
-        rendered = await self._render_documented_image_item(
-            item=event,
-            output_format=output_format,
-            user=user,
-            __request__=__request__,
-            metadata=metadata,
-        )
-        return rendered or ""
-
     async def _render_documented_image_item(
         self,
         item: dict,
@@ -392,37 +296,46 @@ class Pipe:
             return ""
         image_data = item.get("b64_json")
         if image_data:
-            mime_type = (
-                item.get("mime_type")
-                or self._mime_type_from_data_url(image_data)
-                or self._mime_type_for_format(output_format)
-            )
+            mime_type = item.get("mime_type") or self._mime_type_for_format(output_format)
             return await self._upload_image(
                 __request__=__request__,
                 user=user,
-                image_data=image_data,
+                image_source=image_data,
                 mime_type=mime_type,
                 metadata=metadata,
             )
         image_url = item.get("url")
         if image_url:
-            return f"![openai-image-remote]({image_url})"
+            return await self._upload_image(
+                __request__=__request__,
+                user=user,
+                image_source=image_url,
+                mime_type=self._mime_type_for_format(output_format),
+                metadata=metadata,
+            )
         return ""
 
     async def _upload_image(
         self,
         __request__: Request,
         user: UserModel,
-        image_data: str,
+        image_source: str,
         mime_type: str,
         metadata: Optional[dict],
     ) -> str:
-        image_bytes = self._decode_base64_image(image_data)
+        headers = None
+        if image_source.startswith("http://") or image_source.startswith("https://"):
+            headers = {"Authorization": f"Bearer {self.valves.api_key}"}
+
+        image_bytes, detected_mime_type = await get_image_data(image_source, headers=headers)
+        if image_bytes is None:
+            raise ValueError("invalid image data returned by OpenAI image API")
+
         file_item, image_url = await upload_image(
             request=__request__,
             image_data=image_bytes,
-            content_type=mime_type,
-            metadata={"mime_type": mime_type, **(metadata or {})},
+            content_type=detected_mime_type or mime_type,
+            metadata={"mime_type": detected_mime_type or mime_type, **(metadata or {})},
             user=user,
         )
         return f"![openai-image-{file_item.id}]({image_url})"
@@ -508,6 +421,44 @@ class Pipe:
         return form_data
 
     @staticmethod
+    def _collect_image_items(payload: Any) -> list[dict]:
+        if not isinstance(payload, dict):
+            return []
+
+        items = []
+        for container in (payload, payload.get("response")):
+            if not isinstance(container, dict):
+                continue
+
+            data = container.get("data")
+            if isinstance(data, list):
+                items.extend(item for item in data if isinstance(item, dict))
+            elif isinstance(data, dict):
+                items.append(data)
+
+            if any(key in container for key in ("b64_json", "url")):
+                items.append(container)
+
+        return items
+
+    @staticmethod
+    def _extract_usage(payload: Any) -> Optional[dict]:
+        if not isinstance(payload, dict):
+            return None
+
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            return usage
+
+        response = payload.get("response")
+        if isinstance(response, dict):
+            usage = response.get("usage")
+            if isinstance(usage, dict):
+                return usage
+
+        return None
+
+    @staticmethod
     def _mime_type_for_format(output_format: str) -> str:
         return {
             "png": "image/png",
@@ -516,30 +467,43 @@ class Pipe:
         }.get(output_format, "image/png")
 
     @staticmethod
-    def _mime_type_from_data_url(image_data: str) -> str:
-        data = image_data.strip()
-        if data.startswith("data:") and ";" in data:
-            return data.split(";", 1)[0].split(":", 1)[1]
-        return ""
+    def _resolve_size(user_valves: "Pipe.UserValves") -> Optional[str]:
+        if user_valves.size_preset == "auto":
+            return None
+
+        if user_valves.size_preset == "customize":
+            size = user_valves.custom_size.strip()
+        else:
+            size = user_valves.size_preset
+
+        width, height = Pipe._parse_size_string(size)
+        normalized_size = f"{width}x{height}"
+        Pipe._validate_gpt_image_2_size(normalized_size)
+        return normalized_size
 
     @staticmethod
-    def _decode_base64_image(image_data: str) -> bytes:
-        data = image_data.strip()
-        if data.startswith("data:") and "," in data:
-            data = data.split(",", 1)[1]
-        data = "".join(data.split())
+    def _validate_gpt_image_2_size(size: str) -> None:
+        width, height = Pipe._parse_size_string(size)
+        pixels = width * height
+        short_edge = min(width, height)
+        long_edge = max(width, height)
 
-        try:
-            decoded = base64.b64decode(data, validate=True)
-        except (binascii.Error, ValueError):
-            padding = len(data) % 4
-            if padding:
-                data = f"{data}{'=' * (4 - padding)}"
-            decoded = base64.b64decode(data)
+        if width > 3840 or height > 3840:
+            raise ValueError("gpt-image-2 widths and heights must be 3840 pixels or smaller.")
+        if width % 16 != 0 or height % 16 != 0:
+            raise ValueError("gpt-image-2 widths and heights must be multiples of 16.")
+        if pixels < 655360 or pixels > 8294400:
+            raise ValueError("gpt-image-2 image sizes must stay between 655,360 and 8,294,400 total pixels.")
+        if long_edge > short_edge * 3:
+            raise ValueError("gpt-image-2 aspect ratio cannot exceed 3:1.")
 
-        if not decoded:
-            raise ValueError("decoded image bytes is empty")
-        return decoded
+    @staticmethod
+    def _parse_size_string(size: str) -> tuple[int, int]:
+        normalized = size.strip().lower()
+        match = re.fullmatch(r"(\d+)\s*x\s*(\d+)", normalized)
+        if not match:
+            raise ValueError("Custom size must use WIDTHxHEIGHT format, for example 2048x1152.")
+        return int(match.group(1)), int(match.group(2))
 
     @staticmethod
     def _normalize_user_valves(user_valves: Any) -> "Pipe.UserValves":
@@ -547,8 +511,9 @@ class Pipe:
             return user_valves
         if isinstance(user_valves, BaseModel):
             if hasattr(user_valves, "model_dump"):
-                return Pipe.UserValves(**user_valves.model_dump())
-            return Pipe.UserValves(**user_valves.dict())
+                user_valves = user_valves.model_dump()
+            else:
+                user_valves = user_valves.dict()
         return Pipe.UserValves(**(user_valves or {}))
 
     @staticmethod
