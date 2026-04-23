@@ -121,22 +121,16 @@ class Pipe:
 
     def pipes(self):
         return [
-            {"id": model.strip(), "name": model.strip()}
-            for model in self.valves.models.split(",")
-            if model.strip()
+            {"id": model.strip(), "name": model.strip()} for model in self.valves.models.split(",") if model.strip()
         ]
 
-    async def pipe(
-        self, body: dict, __user__: dict, __request__: Request
-    ) -> StreamingResponse:
+    async def pipe(self, body: dict, __user__: dict, __request__: Request) -> StreamingResponse:
         return StreamingResponse(
             self.__stream_pipe(body=body, __user__=__user__, __request__=__request__),
             media_type="text/event-stream",
         )
 
-    async def __stream_pipe(
-        self, body: dict, __user__: dict, __request__: Request
-    ) -> AsyncIterable[str]:
+    async def __stream_pipe(self, body: dict, __user__: dict, __request__: Request) -> AsyncIterable[str]:
         user_valves = self._coerce_user_valves((__user__ or {}).get("valves"))
         model, payload = await self._build_payload(body=body, user_valves=user_valves)
 
@@ -233,17 +227,11 @@ class Pipe:
                     if event_type == "response.completed":
                         response_obj = event.get("response", {})
                         usage = response_obj.get("usage")
-                        response_sources = self._extract_sources_from_response(
-                            response_obj
-                        )
+                        response_sources = self._extract_sources_from_response(response_obj)
                         continue
 
                     if event_type == "response.incomplete":
-                        reason = (
-                            event.get("response", {})
-                            .get("incomplete_details", {})
-                            .get("reason", "unknown")
-                        )
+                        reason = event.get("response", {}).get("incomplete_details", {}).get("reason", "unknown")
                         raise RuntimeError(
                             self._format_upstream_error(
                                 f"OpenAI response incomplete: {reason}",
@@ -252,9 +240,7 @@ class Pipe:
                         )
 
                     if event_type == "response.failed":
-                        err = event.get("response", {}).get("error") or event.get(
-                            "error", {}
-                        )
+                        err = event.get("response", {}).get("error") or event.get("error", {})
                         message = err.get(
                             "message",
                             "An error occurred while processing your request.",
@@ -279,9 +265,7 @@ class Pipe:
                     if_finished=True,
                 )
 
-    async def _build_payload(
-        self, body: dict, user_valves: "Pipe.UserValves", stream: bool = True
-    ) -> Tuple[str, dict]:
+    async def _build_payload(self, body: dict, user_valves: "Pipe.UserValves", stream: bool = True) -> Tuple[str, dict]:
         model = self._extract_model_name(body.get("model", ""))
         messages = self._convert_messages(body.get("messages", []))
         tools = self._build_tools()
@@ -324,9 +308,7 @@ class Pipe:
         elif "max_tokens" in body:
             data["max_output_tokens"] = body["max_tokens"]
 
-        allowed_params = [
-            key.strip() for key in self.valves.allow_params.split(",") if key.strip()
-        ]
+        allowed_params = [key.strip() for key in self.valves.allow_params.split(",") if key.strip()]
         reserved = {
             "model",
             "input",
@@ -356,9 +338,7 @@ class Pipe:
 
     def _extract_model_name(self, raw_model: str) -> str:
         raw_model = (raw_model or "").strip()
-        configured = [
-            model.strip() for model in self.valves.models.split(",") if model.strip()
-        ]
+        configured = [model.strip() for model in self.valves.models.split(",") if model.strip()]
 
         if raw_model in configured:
             return raw_model
@@ -489,9 +469,7 @@ class Pipe:
                 return self.UserValves(**raw.model_dump())
             return self.UserValves(**raw.dict())
 
-        fields = getattr(self.UserValves, "model_fields", None) or getattr(
-            self.UserValves, "__fields__", {}
-        )
+        fields = getattr(self.UserValves, "model_fields", None) or getattr(self.UserValves, "__fields__", {})
         data = {name: getattr(raw, name) for name in fields if hasattr(raw, name)}
         return self.UserValves(**data)
 
@@ -567,9 +545,7 @@ class Pipe:
         model = (model or "").lower()
         return model.startswith("gpt-5")
 
-    def _normalize_reasoning_effort(
-        self, model: str, effort: str, using_web_search: bool
-    ) -> str:
+    def _normalize_reasoning_effort(self, model: str, effort: str, using_web_search: bool) -> str:
         model = (model or "").lower()
 
         if model.startswith("gpt-5.1") or model.startswith("gpt-5.2"):
@@ -608,9 +584,7 @@ class Pipe:
             if item.get("type") == "message":
                 for content in item.get("content", []):
                     for annotation in content.get("annotations", []) or []:
-                        if annotation.get("type") == "url_citation" and annotation.get(
-                            "url"
-                        ):
+                        if annotation.get("type") == "url_citation" and annotation.get("url"):
                             sources.append(
                                 {
                                     "url": annotation["url"],
@@ -663,9 +637,7 @@ class Pipe:
             text += line
         return text
 
-    def _format_upstream_error(
-        self, message: str, request_id: str = "", code: str = ""
-    ) -> str:
+    def _format_upstream_error(self, message: str, request_id: str = "", code: str = "") -> str:
         parts = [message]
         if code:
             parts.append(f"code={code}")
