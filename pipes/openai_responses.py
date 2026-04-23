@@ -187,7 +187,7 @@ class Pipe:
                         if is_thinking and event.get("delta"):
                             yield self._format_stream_data(
                                 model=model,
-                                reasoning_content=event["delta"],
+                                delta={"reasoning_content": event["delta"]},
                             )
                         continue
 
@@ -197,7 +197,7 @@ class Pipe:
                         if event.get("delta"):
                             yield self._format_stream_data(
                                 model=model,
-                                content=event["delta"],
+                                delta={"content": event["delta"]},
                             )
                         continue
 
@@ -257,7 +257,7 @@ class Pipe:
                 if self.valves.append_sources_to_answer:
                     source_text = self._render_sources(annotations, response_sources)
                     if source_text:
-                        yield self._format_stream_data(model=model, content=source_text)
+                        yield self._format_stream_data(model=model, delta={"content": source_text})
 
                 yield self._format_stream_data(
                     model=model,
@@ -548,23 +548,20 @@ class Pipe:
     def _normalize_reasoning_effort(self, model: str, effort: str, using_web_search: bool) -> str:
         model = (model or "").lower()
 
-        if model.startswith("gpt-5.1") or model.startswith("gpt-5.2"):
-            if effort == "xhigh":
-                return "high"
-            if effort in {"none", "low", "medium", "high"}:
-                return effort
-            return "none"
+        if model.startswith(("gpt-5.1", "gpt-5.2")):
+            allowed_efforts = {"none", "low", "medium", "high"}
+            default_effort = "none"
+        elif model.startswith("gpt-5"):
+            allowed_efforts = {"low", "medium", "high"}
+            default_effort = "low"
+        else:
+            return effort
 
-        if model.startswith("gpt-5"):
-            if effort == "none":
-                return "low" if using_web_search else "low"
-            if effort == "xhigh":
-                return "high"
-            if effort in {"low", "medium", "high"}:
-                return effort
-            return "low"
-
-        return effort
+        if effort == "xhigh":
+            return "high"
+        if effort in allowed_efforts:
+            return effort
+        return default_effort
 
     def _extract_sources_from_response(self, response: dict) -> list[dict]:
         sources = []
@@ -632,10 +629,7 @@ class Pipe:
         return "\n".join(lines)
 
     async def _read_error_text(self, response: Response) -> str:
-        text = ""
-        async for line in response.aiter_lines():
-            text += line
-        return text
+        return "".join([line async for line in response.aiter_lines()])
 
     def _format_upstream_error(self, message: str, request_id: str = "", code: str = "") -> str:
         parts = [message]
@@ -660,17 +654,10 @@ class Pipe:
     def _format_stream_data(
         self,
         model: Optional[str] = "",
-        content: Optional[str] = "",
-        reasoning_content: Optional[str] = "",
+        delta: Optional[dict] = None,
         usage: Optional[dict] = None,
         if_finished: bool = False,
     ) -> str:
-        delta = {}
-        if content:
-            delta["content"] = content
-        if reasoning_content:
-            delta["reasoning_content"] = reasoning_content
-
         data = {
             "id": f"chat.{uuid.uuid4().hex}",
             "object": "chat.completion.chunk",
@@ -678,7 +665,7 @@ class Pipe:
                 {
                     "finish_reason": "stop" if if_finished else "",
                     "index": 0,
-                    "delta": delta,
+                    "delta": delta or {},
                 }
             ],
             "created": int(time.time()),
