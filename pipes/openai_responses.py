@@ -1,645 +1,426 @@
 """
-title: OpenAI Responses
+title: OpenAI Responses Minimal
 author: OVINC CN
-git_url: https://github.com/OVINC-CN/OpenWebUIPlugin.git
-version: 0.1.7
+version: 0.1.0
 licence: MIT
 """
 
 import json
-import logging
+import mimetypes
 import time
 import uuid
-from typing import Any, AsyncIterable, Literal, Optional, Tuple
+from pathlib import Path
+from typing import AsyncIterable, Optional
 
 import httpx
 from fastapi import Request
-from httpx import Response
-from open_webui.env import GLOBAL_LOG_LEVEL
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-
-logger = logging.getLogger(__name__)
-logger.setLevel(GLOBAL_LOG_LEVEL)
-
-
-class APIException(Exception):
-    def __init__(
-        self,
-        status: int,
-        content: str,
-        response: Response,
-        request_id: str = "",
-    ):
-        self._status = status
-        self._content = content
-        self._response = response
-        self._request_id = request_id
-
-    def __str__(self) -> str:
-        message = ""
-        try:
-            message = json.loads(self._content)["error"]["message"]
-        except Exception:
-            pass
-
-        if not message:
-            try:
-                self._response.raise_for_status()
-            except Exception as err:
-                message = str(err)
-
-        if not message:
-            message = "Unknown API error"
-
-        if self._request_id:
-            return f"{message} (request_id: {self._request_id})"
-        return message
 
 
 class Pipe:
     class Valves(BaseModel):
         base_url: str = Field(default="https://api.openai.com/v1", title="Base URL")
         api_key: str = Field(default="", title="API Key")
-        enable_reasoning: bool = Field(default=True, title="展示思考内容")
-        allow_params: Optional[str] = Field(
-            default="",
-            title="透传参数",
-            description="允许透传的参数，英文逗号分隔，例如 temperature,top_p",
-        )
+        models: str = Field(default="gpt-5.5", title="模型")
         timeout: int = Field(default=600, title="请求超时时间（秒）")
-        proxy: Optional[str] = Field(default="", title="代理地址")
-        models: str = Field(
-            default="gpt-5.1,gpt-5",
-            title="模型",
-            description="使用英文逗号分隔多个模型",
-        )
-
         enable_web_search: bool = Field(default=True, title="启用 OpenAI Web Search")
-        web_search_context_size: Literal["low", "medium", "high"] = Field(
-            default="medium",
-            title="Web Search 上下文大小",
-        )
-        web_search_domains: Optional[str] = Field(
-            default="",
-            title="Web Search 域名白名单",
-            description="英文逗号分隔，例如 openai.com,platform.openai.com",
-        )
-        web_search_country: Optional[str] = Field(
-            default="",
-            title="搜索国家",
-            description="两位国家代码，例如 US、CN",
-        )
-        web_search_city: Optional[str] = Field(default="", title="搜索城市")
-        web_search_region: Optional[str] = Field(default="", title="搜索地区/省州")
-        web_search_timezone: Optional[str] = Field(
-            default="",
-            title="搜索时区",
-            description="IANA 时区，例如 Asia/Shanghai",
-        )
-        append_sources_to_answer: bool = Field(
-            default=True,
-            title="在答案末尾追加来源链接",
-        )
-
-    class UserValves(BaseModel):
-        verbosity: Literal["low", "medium", "high"] = Field(
-            default="medium",
-            title="输出详细程度",
-        )
-        reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] = Field(
-            default="low",
-            title="思考推理强度",
-        )
-        summary: Literal["auto", "concise", "detailed"] = Field(
-            default="auto",
-            title="思考输出摘要程度",
-        )
 
     def __init__(self):
         self.valves = self.Valves()
 
     def pipes(self):
         return [
-            {"id": model.strip(), "name": model.strip()} for model in self.valves.models.split(",") if model.strip()
+            {"id": model.strip(), "name": model.strip()}
+            for model in self.valves.models.split(",")
+            if model.strip()
         ]
 
-    async def pipe(self, body: dict, __user__: dict, __request__: Request) -> StreamingResponse:
+    async def pipe(
+        self,
+        body: dict,
+        __user__: dict,
+        __request__: Request,
+        __files__: Optional[list[dict]] = None,
+    ) -> StreamingResponse:
         return StreamingResponse(
-            self.__stream_pipe(body=body, __user__=__user__, __request__=__request__),
+            self._stream(body, __files__ or []),
             media_type="text/event-stream",
         )
 
-    async def __stream_pipe(self, body: dict, __user__: dict, __request__: Request) -> AsyncIterable[str]:
-        user_valves = self._coerce_user_valves((__user__ or {}).get("valves"))
-        model, payload = await self._build_payload(body=body, user_valves=user_valves)
+    async def _stream(self, body: dict, injected_files: list[dict]) -> AsyncIterable[str]:
+        api_key = (self.valves.api_key or "").strip()
+        if not api_key:
+            raise RuntimeError("OpenAI API Key is empty. Please set the API Key valve.")
+
+        model = self._extract_model_name(body.get("model", ""))
+        body_files = list(body.get("files") or [])
+        body_files.extend(injected_files)
+        data = {
+            "model": model,
+            "input": self._convert_messages(
+                body.get("messages", []),
+                body_files=body_files,
+            ),
+            "stream": True,
+        }
+
+        if model.lower().startswith("gpt-5"):
+            data["reasoning"] = {"effort": "high", "summary": "auto"}
+
+        if self.valves.enable_web_search:
+            data["tools"] = [{"type": "web_search"}]
+            data["tool_choice"] = "auto"
 
         async with httpx.AsyncClient(
             base_url=self.valves.base_url.rstrip("/") + "/",
-            headers={"Authorization": f"Bearer {self.valves.api_key}"},
-            proxy=self.valves.proxy or None,
-            trust_env=True,
+            headers={"Authorization": f"Bearer {api_key}"},
             timeout=self.valves.timeout,
         ) as client:
-            async with client.stream(**payload) as response:
-                request_id = response.headers.get("x-request-id", "")
-
+            async with client.stream("POST", "responses", json=data) as response:
                 if response.status_code != 200:
-                    text = await self._read_error_text(response)
-                    logger.error(
-                        "response invalid with %d request_id=%s body=%s",
-                        response.status_code,
-                        request_id,
-                        text,
-                    )
-                    raise APIException(
-                        status=response.status_code,
-                        content=text,
-                        response=response,
-                        request_id=request_id,
-                    )
-
-                is_thinking = self.valves.enable_reasoning
-                usage = None
-                annotations = []
-                response_sources = []
+                    error = await response.aread()
+                    raise RuntimeError(error.decode("utf-8", errors="replace"))
 
                 async for line in response.aiter_lines():
                     line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("event:") or not line.startswith("data:"):
+                    if not line.startswith("data:"):
                         continue
 
-                    line = line[5:].strip()
-                    if not line or line == "[DONE]":
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
                         continue
 
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.warning("ignore invalid stream line: %s", line)
-                        continue
-
-                    event_type = event.get("type", "")
+                    event = json.loads(raw)
+                    event_type = event.get("type")
 
                     if event_type == "response.reasoning_summary_text.delta":
-                        if is_thinking and event.get("delta"):
-                            yield self._format_stream_data(
-                                model=model,
-                                delta={"reasoning_content": event["delta"]},
-                            )
-                        continue
+                        delta = event.get("delta")
+                        if delta:
+                            yield self._chunk(model, {"reasoning_content": delta})
 
-                    if event_type == "response.output_text.delta":
-                        if is_thinking:
-                            is_thinking = False
-                        if event.get("delta"):
-                            yield self._format_stream_data(
-                                model=model,
-                                delta={"content": event["delta"]},
-                            )
-                        continue
+                    elif event_type == "response.output_text.delta":
+                        delta = event.get("delta")
+                        if delta:
+                            yield self._chunk(model, {"content": delta})
 
-                    if event_type == "response.output_text.annotation.added":
-                        annotation = event.get("annotation", {})
-                        if annotation.get("type") == "url_citation":
-                            annotations.append(annotation)
-                        continue
-
-                    if event_type in {
+                    elif event_type in {
                         "response.web_search_call.searching",
                         "response.web_search_call.in_progress",
                     }:
-                        yield self._format_status_data(
-                            description="web search",
-                            done=False,
+                        yield self._status("web search", done=False)
+
+                    elif event_type == "response.web_search_call.completed":
+                        yield self._status("web search completed", done=True)
+
+                    elif event_type == "response.failed":
+                        error = event.get("response", {}).get("error") or {}
+                        raise RuntimeError(error.get("message", "OpenAI response failed"))
+
+                    elif event_type == "response.incomplete":
+                        details = event.get("response", {}).get(
+                            "incomplete_details", {}
                         )
-                        continue
+                        reason = details.get("reason", "unknown")
+                        raise RuntimeError(f"OpenAI response incomplete: {reason}")
 
-                    if event_type == "response.web_search_call.completed":
-                        yield self._format_status_data(
-                            description="web search completed",
-                            done=True,
-                        )
-                        continue
-
-                    if event_type == "response.completed":
-                        response_obj = event.get("response", {})
-                        usage = response_obj.get("usage")
-                        response_sources = self._extract_sources_from_response(response_obj)
-                        continue
-
-                    if event_type == "response.incomplete":
-                        reason = event.get("response", {}).get("incomplete_details", {}).get("reason", "unknown")
-                        raise RuntimeError(
-                            self._format_upstream_error(
-                                f"OpenAI response incomplete: {reason}",
-                                request_id=request_id,
-                            )
-                        )
-
-                    if event_type == "response.failed":
-                        err = event.get("response", {}).get("error") or event.get("error", {})
-                        message = err.get(
-                            "message",
-                            "An error occurred while processing your request.",
-                        )
-                        code = err.get("code", "")
-                        raise RuntimeError(
-                            self._format_upstream_error(
-                                message=message,
-                                request_id=request_id,
-                                code=code,
-                            )
-                        )
-
-                if self.valves.append_sources_to_answer:
-                    source_text = self._render_sources(annotations, response_sources)
-                    if source_text:
-                        yield self._format_stream_data(model=model, delta={"content": source_text})
-
-                yield self._format_stream_data(
-                    model=model,
-                    usage=usage,
-                    if_finished=True,
-                )
-
-    async def _build_payload(self, body: dict, user_valves: "Pipe.UserValves", stream: bool = True) -> Tuple[str, dict]:
-        model = self._extract_model_name(body.get("model", ""))
-        messages = self._convert_messages(body.get("messages", []))
-        tools = self._build_tools()
-
-        incoming_tools = body.get("tools") or []
-        incoming_tool_choice = body.get("tool_choice")
-
-        if incoming_tools:
-            logger.info(
-                "ignoring incoming OpenWebUI tools, using OpenAI web_search only: %s",
-                self._summarize_tools(incoming_tools),
-            )
-
-        if incoming_tool_choice not in (None, "", "auto"):
-            logger.info(
-                "ignoring incoming OpenWebUI tool_choice, forcing auto: %s",
-                incoming_tool_choice,
-            )
-
-        data: dict[str, Any] = {
-            "model": model,
-            "input": messages,
-            "stream": stream,
-            "store": False,
-        }
-
-        if self._is_gpt5_family(model):
-            data["text"] = {"verbosity": user_valves.verbosity}
-            reasoning_effort = self._normalize_reasoning_effort(
-                model=model,
-                effort=user_valves.reasoning_effort,
-                using_web_search=bool(tools),
-            )
-            data["reasoning"] = {"effort": reasoning_effort}
-            if self.valves.enable_reasoning:
-                data["reasoning"]["summary"] = user_valves.summary
-
-        if "max_completion_tokens" in body:
-            data["max_output_tokens"] = body["max_completion_tokens"]
-        elif "max_tokens" in body:
-            data["max_output_tokens"] = body["max_tokens"]
-
-        allowed_params = [key.strip() for key in self.valves.allow_params.split(",") if key.strip()]
-        reserved = {
-            "model",
-            "input",
-            "messages",
-            "tools",
-            "tool_choice",
-            "stream",
-            "store",
-            "text",
-            "reasoning",
-            "include",
-            "max_completion_tokens",
-            "max_tokens",
-        }
-        for key, val in body.items():
-            if key in allowed_params and key not in reserved:
-                data[key] = val
-
-        if tools:
-            data["tools"] = tools
-            data["tool_choice"] = "auto"
-            data["include"] = ["web_search_call.action.sources"]
-
-        payload = {"method": "POST", "url": "responses", "json": data}
-        logger.debug("responses payload=%s", json.dumps(data, ensure_ascii=False))
-        return model, payload
+        yield self._chunk(model, {}, finished=True)
 
     def _extract_model_name(self, raw_model: str) -> str:
         raw_model = (raw_model or "").strip()
-        configured = [model.strip() for model in self.valves.models.split(",") if model.strip()]
+        models = [m.strip() for m in self.valves.models.split(",") if m.strip()]
 
-        if raw_model in configured:
+        if raw_model in models:
             return raw_model
 
-        for model in sorted(configured, key=len, reverse=True):
+        for model in sorted(models, key=len, reverse=True):
             if raw_model.endswith(f".{model}"):
                 return model
 
-        return raw_model
+        return raw_model or models[0]
 
-    def _convert_messages(self, messages: list[dict]) -> list[dict]:
+    def _convert_messages(
+        self, messages: list[dict], body_files: Optional[list[dict]] = None
+    ) -> list[dict]:
         converted = []
+        body_files = body_files or []
+        last_user_index = self._last_user_message_index(messages)
 
-        for message in messages:
-            role = (message.get("role") or "user").strip()
+        for index, message in enumerate(messages):
+            role = message.get("role") or "user"
             if role not in {"user", "assistant", "system", "developer"}:
                 role = "user"
 
-            content_value = message.get("content", "")
+            files = list(message.get("files") or [])
+            if body_files and index == last_user_index:
+                files.extend(body_files)
 
-            if isinstance(content_value, str):
-                converted.append(
-                    {
-                        "type": "message",
-                        "role": role,
-                        "content": content_value,
-                    }
-                )
-                continue
+            content = self._convert_content(
+                message.get("content", ""),
+                role=role,
+                files=files,
+            )
 
-            if isinstance(content_value, list):
-                if role == "assistant":
-                    content = self._convert_assistant_content(content_value)
-                else:
-                    content = self._convert_input_content(content_value)
-
-                if not content:
-                    content = ""
-
-                converted.append(
-                    {
-                        "type": "message",
-                        "role": role,
-                        "content": content,
-                    }
-                )
-                continue
-
-            raise TypeError("Invalid message content type %s" % type(content_value))
-
-        return converted
-
-    def _convert_input_content(self, items: list[dict]) -> list[dict]:
-        content = []
-
-        for item in items:
-            item_type = item.get("type")
-
-            if item_type in {"text", "input_text"}:
-                content.append({"type": "input_text", "text": item.get("text", "")})
-            elif item_type == "image_url":
-                image_url = item.get("image_url", {})
-                if isinstance(image_url, dict):
-                    image_url = image_url.get("url", "")
-                content.append(
-                    {
-                        "type": "input_image",
-                        "image_url": image_url,
-                    }
-                )
-            elif item_type == "input_image":
-                content.append(item)
-            elif item_type == "input_file":
-                content.append(item)
-            elif item_type == "output_text":
-                content.append({"type": "input_text", "text": item.get("text", "")})
-            elif item_type == "refusal":
-                content.append({"type": "input_text", "text": item.get("refusal", "")})
-            elif item_type == "reasoning_content":
-                text = item.get("text") or item.get("reasoning_content") or ""
-                if text:
-                    content.append({"type": "input_text", "text": text})
-            else:
-                text = item.get("text")
-                if isinstance(text, str):
-                    content.append({"type": "input_text", "text": text})
-                else:
-                    raise TypeError("Invalid message content type %s" % item_type)
-
-        return content
-
-    def _convert_assistant_content(self, items: list[dict]) -> list[dict]:
-        content = []
-
-        for item in items:
-            item_type = item.get("type")
-
-            if item_type in {"text", "output_text", "input_text"}:
-                content.append({"type": "output_text", "text": item.get("text", "")})
-            elif item_type == "refusal":
-                content.append(
-                    {
-                        "type": "refusal",
-                        "refusal": item.get("refusal", ""),
-                    }
-                )
-            elif item_type == "reasoning_content":
-                continue
-            else:
-                text = item.get("text")
-                if isinstance(text, str):
-                    content.append({"type": "output_text", "text": text})
-
-        return content
-
-    def _coerce_user_valves(self, raw: Any) -> "Pipe.UserValves":
-        if isinstance(raw, self.UserValves):
-            return raw
-
-        if raw is None:
-            return self.UserValves()
-
-        if isinstance(raw, dict):
-            return self.UserValves(**raw)
-
-        if isinstance(raw, BaseModel):
-            if hasattr(raw, "model_dump"):
-                return self.UserValves(**raw.model_dump())
-            return self.UserValves(**raw.dict())
-
-        fields = getattr(self.UserValves, "model_fields", None) or getattr(self.UserValves, "__fields__", {})
-        data = {name: getattr(raw, name) for name in fields if hasattr(raw, name)}
-        return self.UserValves(**data)
-
-    def _build_tools(self) -> list[dict]:
-        if not self.valves.enable_web_search:
-            return []
-
-        tool = {
-            "type": "web_search",
-            "search_context_size": self.valves.web_search_context_size,
-        }
-
-        domains = self._parse_domains(self.valves.web_search_domains)
-        if domains:
-            tool["filters"] = {"allowed_domains": domains}
-
-        user_location = self._build_user_location()
-        if user_location:
-            tool["user_location"] = user_location
-
-        return [tool]
-
-    def _build_user_location(self) -> Optional[dict]:
-        values = {
-            "type": "approximate",
-            "country": (self.valves.web_search_country or "").strip().upper(),
-            "city": (self.valves.web_search_city or "").strip(),
-            "region": (self.valves.web_search_region or "").strip(),
-            "timezone": (self.valves.web_search_timezone or "").strip(),
-        }
-        if not any(
-            [
-                values["country"],
-                values["city"],
-                values["region"],
-                values["timezone"],
-            ]
-        ):
-            return None
-        return {k: v for k, v in values.items() if v}
-
-    def _parse_domains(self, raw_domains: Optional[str]) -> list[str]:
-        domains = []
-        for domain in (raw_domains or "").split(","):
-            domain = domain.strip().lower()
-            if not domain:
-                continue
-            if domain.startswith("http://"):
-                domain = domain[7:]
-            elif domain.startswith("https://"):
-                domain = domain[8:]
-            domain = domain.rstrip("/")
-            if domain:
-                domains.append(domain)
-        return domains
-
-    def _summarize_tools(self, tools: list[dict]) -> list[str]:
-        summary = []
-        for tool in tools:
-            if not isinstance(tool, dict):
-                summary.append(str(type(tool)))
-                continue
-
-            tool_type = tool.get("type", "")
-            if tool_type == "function":
-                fn = tool.get("function", {}) or {}
-                summary.append(f"function:{fn.get('name', 'unknown')}")
-            else:
-                summary.append(tool_type or "unknown")
-        return summary
-
-    def _is_gpt5_family(self, model: str) -> bool:
-        model = (model or "").lower()
-        return model.startswith("gpt-5")
-
-    def _normalize_reasoning_effort(self, model: str, effort: str, using_web_search: bool) -> str:
-        model = (model or "").lower()
-
-        if model.startswith(("gpt-5.1", "gpt-5.2")):
-            allowed_efforts = {"none", "low", "medium", "high"}
-            default_effort = "none"
-        elif model.startswith("gpt-5"):
-            allowed_efforts = {"low", "medium", "high"}
-            default_effort = "low"
-        else:
-            return effort
-
-        if effort == "xhigh":
-            return "high"
-        if effort in allowed_efforts:
-            return effort
-        return default_effort
-
-    def _extract_sources_from_response(self, response: dict) -> list[dict]:
-        sources = []
-
-        for item in response.get("output", []):
-            if item.get("type") == "web_search_call":
-                action = item.get("action", {}) or {}
-                for source in action.get("sources", []) or []:
-                    if source.get("url"):
-                        sources.append(
-                            {
-                                "url": source["url"],
-                                "title": source.get("title", ""),
-                            }
-                        )
-
-            if item.get("type") == "message":
-                for content in item.get("content", []):
-                    for annotation in content.get("annotations", []) or []:
-                        if annotation.get("type") == "url_citation" and annotation.get("url"):
-                            sources.append(
-                                {
-                                    "url": annotation["url"],
-                                    "title": annotation.get("title", ""),
-                                }
-                            )
-
-        return sources
-
-    def _render_sources(self, annotations: list[dict], sources: list[dict]) -> str:
-        merged = []
-
-        for annotation in annotations:
-            if annotation.get("url"):
-                merged.append(
-                    {
-                        "url": annotation["url"],
-                        "title": annotation.get("title", ""),
-                    }
-                )
-
-        merged.extend(sources)
-
-        deduped = []
-        seen = set()
-        for item in merged:
-            url = item.get("url", "").strip()
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            deduped.append(
+            converted.append(
                 {
-                    "url": url,
-                    "title": item.get("title", "").strip(),
+                    "type": "message",
+                    "role": role,
+                    "content": content,
                 }
             )
 
-        if not deduped:
-            return ""
+        return converted
 
-        lines = ["", "", "Sources:"]
-        for idx, item in enumerate(deduped, start=1):
-            title = item["title"] or item["url"]
-            lines.append(f"{idx}. {title} - {item['url']}")
-        return "\n".join(lines)
+    def _last_user_message_index(self, messages: list[dict]) -> int:
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].get("role") == "user":
+                return index
+        return len(messages) - 1
 
-    async def _read_error_text(self, response: Response) -> str:
-        return "".join([line async for line in response.aiter_lines()])
+    def _convert_content(self, content: object, role: str, files: list[dict]) -> object:
+        if isinstance(content, str) and not files:
+            return content
 
-    def _format_upstream_error(self, message: str, request_id: str = "", code: str = "") -> str:
-        parts = [message]
-        if code:
-            parts.append(f"code={code}")
-        if request_id:
-            parts.append(f"request_id={request_id}")
-        return " | ".join(parts)
+        parts = []
 
-    def _format_status_data(self, description: str, done: bool) -> str:
+        if isinstance(content, str):
+            if content:
+                parts.append(self._text_part(content, role))
+        elif isinstance(content, list):
+            for item in content:
+                part = self._convert_content_part(item, role)
+                if part:
+                    parts.append(part)
+        else:
+            raise TypeError("Invalid message content type %s" % type(content))
+
+        for file in files:
+            part = self._convert_file_part(file)
+            if part:
+                parts.append(part)
+
+        return parts or ""
+
+    def _convert_content_part(self, item: object, role: str) -> Optional[dict]:
+        if not isinstance(item, dict):
+            return None
+
+        item_type = item.get("type")
+
+        if item_type in {"text", "input_text", "output_text"}:
+            text = item.get("text", "")
+            if isinstance(text, str):
+                return self._text_part(text, role)
+
+        if item_type in {"image_url", "input_image"}:
+            image_url = self._url_string(item.get("image_url") or item.get("url"))
+
+            part = {"type": "input_image"}
+            if image_url:
+                part["image_url"] = image_url
+            if item.get("file_id"):
+                part["file_id"] = item["file_id"]
+            if item.get("detail"):
+                part["detail"] = item["detail"]
+            return part if len(part) > 1 else None
+
+        if item_type in {"file", "input_file"}:
+            return self._convert_file_part(item)
+
+        if item_type == "refusal":
+            refusal = item.get("refusal", "")
+            if isinstance(refusal, str):
+                return self._text_part(refusal, role)
+
+        text = item.get("text")
+        if isinstance(text, str):
+            return self._text_part(text, role)
+
+        return self._convert_file_part(item)
+
+    def _convert_file_part(self, item: dict) -> Optional[dict]:
+        file = item.get("file") if isinstance(item.get("file"), dict) else item
+        if self._is_image_file(file):
+            return self._convert_image_file_part(file)
+
+        part = {"type": "input_file"}
+
+        file_id = self._openai_file_id(file)
+        filename = file.get("filename") or file.get("name")
+        file_url = self._url_string(file.get("file_url") or file.get("url"))
+        file_data = self._data_url(
+            file.get("file_data") or file.get("data"),
+            filename=filename,
+            mime_type=self._mime_type(file, filename),
+        )
+
+        if file_id:
+            part["file_id"] = file_id
+        if file_url:
+            part["file_url"] = file_url
+        if file_data:
+            part["file_data"] = file_data
+        if filename:
+            part["filename"] = filename
+
+        if file_id or file_url or file_data:
+            return part
+        return None
+
+    def _convert_image_file_part(self, file: dict) -> Optional[dict]:
+        part = {"type": "input_image"}
+
+        file_id = self._openai_file_id(file)
+        image_url = self._url_string(file.get("image_url") or file.get("url"))
+        image_data = self._data_url(
+            file.get("file_data") or file.get("data"),
+            filename=file.get("filename") or file.get("name"),
+            mime_type=self._mime_type(file, file.get("filename") or file.get("name")),
+            default_mime_type="image/png",
+        )
+
+        if file_id:
+            part["file_id"] = file_id
+        if image_url:
+            part["image_url"] = image_url
+        elif image_data:
+            part["image_url"] = image_data
+
+        if file.get("detail"):
+            part["detail"] = file["detail"]
+
+        if file_id or image_url or image_data:
+            return part
+        return None
+
+    def _is_image_file(self, file: dict) -> bool:
+        file_type = str(
+            file.get("mime_type")
+            or file.get("mime")
+            or file.get("content_type")
+            or file.get("type")
+            or ""
+        ).lower()
+        filename = str(file.get("filename") or file.get("name") or "").lower()
+        url = str(self._url_string(file.get("image_url") or file.get("url")) or "").lower()
+        data = self._extract_data_string(file.get("file_data") or file.get("data"))
+        data_prefix = (data or "")[:32].lower()
+
+        return (
+            file_type.startswith("image/")
+            or file_type == "image"
+            or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+            or Path(url).suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+            or data_prefix.startswith("data:image/")
+        )
+
+    def _openai_file_id(self, file: dict) -> Optional[str]:
+        file_id = file.get("file_id")
+        if isinstance(file_id, str) and file_id:
+            return file_id
+
+        raw_id = file.get("id")
+        if isinstance(raw_id, str) and raw_id.startswith("file-"):
+            return raw_id
+
+        return None
+
+    def _data_url(
+        self,
+        raw: object,
+        filename: object = None,
+        mime_type: Optional[str] = None,
+        default_mime_type: str = "application/octet-stream",
+    ) -> Optional[str]:
+        data = self._extract_data_string(raw)
+        if not data:
+            return None
+
+        data = data.strip()
+        if data.startswith("data:"):
+            return data
+
+        if data.startswith(("http://", "https://")):
+            return None
+
+        mime_type = mime_type or self._mime_type({}, filename) or default_mime_type
+        return f"data:{mime_type};base64,{data}"
+
+    def _url_string(self, raw: object) -> Optional[str]:
+        if isinstance(raw, str):
+            return raw
+
+        if isinstance(raw, dict):
+            for key in ("url", "href", "file_url", "image_url"):
+                value = raw.get(key)
+                if isinstance(value, str):
+                    return value
+
+        return None
+
+    def _extract_data_string(self, raw: object) -> Optional[str]:
+        if isinstance(raw, str):
+            return raw
+
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="ignore")
+
+        if isinstance(raw, dict):
+            for key in (
+                "data",
+                "content",
+                "base64",
+                "base64_data",
+                "file_data",
+                "body",
+                "value",
+            ):
+                value = raw.get(key)
+                extracted = self._extract_data_string(value)
+                if extracted:
+                    return extracted
+
+        return None
+
+    def _mime_type(self, file: dict, filename: object = None) -> Optional[str]:
+        explicit = (
+            file.get("mime_type")
+            or file.get("mime")
+            or file.get("content_type")
+            or file.get("type")
+        )
+        if isinstance(explicit, str) and "/" in explicit:
+            return explicit
+
+        if isinstance(filename, str):
+            guessed, _ = mimetypes.guess_type(filename)
+            if guessed:
+                return guessed
+
+        return None
+
+    def _text_part(self, text: str, role: str) -> dict:
+        if role == "assistant":
+            return {"type": "output_text", "text": text}
+        return {"type": "input_text", "text": text}
+
+    def _chunk(self, model: str, delta: dict, finished: bool = False) -> str:
+        data = {
+            "id": f"chat.{uuid.uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop" if finished else None,
+                    "delta": delta,
+                }
+            ],
+        }
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def _status(self, description: str, done: bool) -> str:
         data = {
             "event": {
                 "type": "status",
@@ -649,30 +430,4 @@ class Pipe:
                 },
             }
         }
-        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-    def _format_stream_data(
-        self,
-        model: Optional[str] = "",
-        delta: Optional[dict] = None,
-        usage: Optional[dict] = None,
-        if_finished: bool = False,
-    ) -> str:
-        data = {
-            "id": f"chat.{uuid.uuid4().hex}",
-            "object": "chat.completion.chunk",
-            "choices": [
-                {
-                    "finish_reason": "stop" if if_finished else "",
-                    "index": 0,
-                    "delta": delta or {},
-                }
-            ],
-            "created": int(time.time()),
-            "model": model,
-        }
-
-        if usage:
-            data["usage"] = usage
-
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
